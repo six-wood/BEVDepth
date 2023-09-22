@@ -217,6 +217,3 @@ events.out.tfevents*
 
 # vim
 .vim
-
-#mmdetection3D
-./mmdetection3D
