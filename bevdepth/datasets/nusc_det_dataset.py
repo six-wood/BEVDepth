@@ -79,7 +79,8 @@ def img_transform(img, resize, resize_dims, crop, flip, rotate):  # 进行图像
     return img, ida_mat
 
 
-def bev_transform(gt_boxes, rotate_angle, scale_ratio, flip_dx, flip_dy):
+def bev_transform(gt_boxes, rotate_angle, scale_ratio, flip_dx, flip_dy):  # 根据图像增强参数对gt_boxes进行变换
+    # gt_box为三维边界框，与图像增强的二维变换不一样
     rotate_angle = torch.tensor(rotate_angle / 180 * np.pi)
     rot_sin = torch.sin(rotate_angle)
     rot_cos = torch.cos(rotate_angle)
@@ -319,7 +320,7 @@ class NuscDetDataset(Dataset):
                                                    ratio)).tolist()
         return sample_indices
 
-    def sample_ida_augmentation(self):
+    def sample_ida_augmentation(self):  # 生成具体增强参数
         """Generate ida augmentation values based on ida_config."""
         H, W = self.ida_aug_conf['H'], self.ida_aug_conf['W']
         fH, fW = self.ida_aug_conf['final_dim']
