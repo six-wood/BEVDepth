@@ -14,60 +14,62 @@ from .base_lss_fpn import ASPP, BaseLSSFPN, Mlp, SELayer
 __all__ = ['FusionLSSFPN']
 
 
-class DepthNet(nn.Module):
+class DepthNet(nn.Module):  # 一层卷积网络回归深度
 
     def __init__(self, in_channels, mid_channels, context_channels,
                  depth_channels):
         super(DepthNet, self).__init__()
+        # 效果是一倍降采样
         self.reduce_conv = nn.Sequential(
             nn.Conv2d(in_channels,
                       mid_channels,
                       kernel_size=3,
                       stride=1,
-                      padding=1),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
+                      padding=1),  # 卷积
+            nn.BatchNorm2d(mid_channels),  # 正则化
+            nn.ReLU(inplace=True),  # 激活
         )
         self.context_conv = nn.Conv2d(mid_channels,
                                       context_channels,
                                       kernel_size=1,
                                       stride=1,
-                                      padding=0)
-        self.mlp = Mlp(1, mid_channels, mid_channels)
-        self.se = SELayer(mid_channels)  # NOTE: add camera-aware
+                                      padding=0)  # 起MLP作用的卷积网络，改变通道数，生成目标维度语义信息
+        self.mlp = Mlp(1, mid_channels, mid_channels)  # MLP
+        self.se = SELayer(mid_channels)  # NOTE: add camera-aware Attention
         self.depth_gt_conv = nn.Sequential(
             nn.Conv2d(1, mid_channels, kernel_size=1, stride=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, mid_channels, kernel_size=1, stride=1),
-        )
+        )  # 用于预测深度带有卷积、激活
         self.depth_conv = nn.Sequential(
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
-        )
+        )  # resnet 基础残差模块
         self.aspp = ASPP(mid_channels, mid_channels)
         self.depth_pred = nn.Conv2d(mid_channels,
                                     depth_channels,
                                     kernel_size=1,
                                     stride=1,
-                                    padding=0)
+                                    padding=0)  # 生成目标通道数的深度结果
 
     def forward(self, x, mats_dict, lidar_depth, scale_depth_factor=1000.0):
-        x = self.reduce_conv(x)
-        context = self.context_conv(x)
+        x = self.reduce_conv(x)  # 1倍将采样
+        context = self.context_conv(x)  # 改变通道数 512->80
         inv_intrinsics = torch.inverse(mats_dict['intrin_mats'][:, 0:1, ...])
         pixel_size = torch.norm(torch.stack(
             [inv_intrinsics[..., 0, 0], inv_intrinsics[..., 1, 1]], dim=-1),
-                                dim=-1).reshape(-1, 1)
+            dim=-1).reshape(-1, 1)
         aug_scale = torch.sqrt(mats_dict['ida_mats'][:, 0, :, 0, 0]**2 +
                                mats_dict['ida_mats'][:, 0, :, 0,
                                                      0]**2).reshape(-1, 1)
         scaled_pixel_size = pixel_size * scale_depth_factor / aug_scale
-        x_se = self.mlp(scaled_pixel_size)[..., None, None]
-        x = self.se(x, x_se)
-        depth = self.depth_gt_conv(lidar_depth)
-        depth = self.depth_conv(x + depth)
-        depth = self.aspp(depth)
+        x_se = self.mlp(scaled_pixel_size)[..., None, None]  # 根据内参矩阵，增强矩阵生成特征量
+        x = self.se(x, x_se)  # 通道加权
+        depth = self.depth_gt_conv(lidar_depth)  # 先升维
+        depth = self.depth_conv(x + depth)  # 语义与深度融合
+        depth = self.aspp(depth)  # 多尺度融合
+        # 预测深度depth feature channel
         depth = self.depth_pred(depth)
         return torch.cat([depth, context], dim=1)
 
@@ -118,18 +120,19 @@ class FusionLSSFPN(BaseLSSFPN):
         """
         batch_size, num_sweeps, num_cams, num_channels, img_height, \
             img_width = sweep_imgs.shape
+        # 提取特征, batchsize*sweep*camera*C*H*W
         img_feats = self.get_cam_feats(sweep_imgs)
         sweep_lidar_depth = sweep_lidar_depth.reshape(
-            batch_size * num_cams, *sweep_lidar_depth.shape[2:])
+            batch_size * num_cams, *sweep_lidar_depth.shape[2:])  # batchsize*camera*1*H*W
         source_features = img_feats[:, 0, ...]
-        depth_feature = self._forward_depth_net(
+        depth_feature = self._forward_depth_net(  # 根据sweep[0]预测深度
             source_features.reshape(batch_size * num_cams,
                                     source_features.shape[2],
                                     source_features.shape[3],
                                     source_features.shape[4]), mats_dict,
             sweep_lidar_depth)
         depth = depth_feature[:, :self.depth_channels].softmax(
-            dim=1, dtype=depth_feature.dtype)
+            dim=1, dtype=depth_feature.dtype)  # 转换为概率
         geom_xyz = self.get_geometry(
             mats_dict['sensor2ego_mats'][:, sweep_index, ...],
             mats_dict['intrin_mats'][:, sweep_index, ...],
@@ -137,13 +140,14 @@ class FusionLSSFPN(BaseLSSFPN):
             mats_dict.get('bda_mat', None),
         )
         geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) /
-                    self.voxel_size).int()
+                    self.voxel_size).int()  # 化为网格坐标
         if self.training or self.use_da:
             img_feat_with_depth = depth.unsqueeze(
                 1) * depth_feature[:, self.depth_channels:(
-                    self.depth_channels + self.output_channels)].unsqueeze(2)
+                    self.depth_channels + self.output_channels)].unsqueeze(2)  # 升维
 
-            img_feat_with_depth = self._forward_voxel_net(img_feat_with_depth)
+            img_feat_with_depth = self._forward_voxel_net(
+                img_feat_with_depth)  # 特征提取
 
             img_feat_with_depth = img_feat_with_depth.reshape(
                 batch_size,
@@ -152,13 +156,14 @@ class FusionLSSFPN(BaseLSSFPN):
                 img_feat_with_depth.shape[2],
                 img_feat_with_depth.shape[3],
                 img_feat_with_depth.shape[4],
-            )
+            )  # batchsize*camera*C*D*H*W
 
-            img_feat_with_depth = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2)
+            img_feat_with_depth = img_feat_with_depth.permute(
+                0, 1, 3, 4, 5, 2)  # batchsize*camera*D*H*W*C
 
             feature_map = voxel_pooling_train(geom_xyz,
                                               img_feat_with_depth.contiguous(),
-                                              self.voxel_num.cuda())
+                                              self.voxel_num.cuda())  # 基于cuda的voxel_pooling_train batchsize*C*H*W
         else:
             feature_map = voxel_pooling_inference(
                 geom_xyz, depth, depth_feature[:, self.depth_channels:(
@@ -166,7 +171,7 @@ class FusionLSSFPN(BaseLSSFPN):
                 self.voxel_num.cuda())
         if is_return_depth:
             return feature_map.contiguous(), depth.float()
-        return feature_map.contiguous()
+        return feature_map.contiguous()  # 输出voxel_pooling结果
 
     def forward(self,
                 sweep_imgs,
@@ -201,7 +206,11 @@ class FusionLSSFPN(BaseLSSFPN):
         """
         batch_size, num_sweeps, num_cams, num_channels, img_height, \
             img_width = sweep_imgs.shape
+
+        # 降采样lidar尺寸
         lidar_depth = self.get_downsampled_lidar_depth(lidar_depth)
+
+        # forward single sweep
         key_frame_res = self._forward_single_sweep(
             0,
             sweep_imgs[:, 0:1, ...],
@@ -232,22 +241,24 @@ class FusionLSSFPN(BaseLSSFPN):
 
     def get_downsampled_lidar_depth(self, lidar_depth):
         batch_size, num_sweeps, num_cams, height, width = lidar_depth.shape
+        # 对H、W分别进行降采样
         lidar_depth = lidar_depth.view(
-            batch_size * num_sweeps * num_cams,
-            height // self.downsample_factor,
-            self.downsample_factor,
-            width // self.downsample_factor,
-            self.downsample_factor,
-            1,
+            batch_size * num_sweeps * num_cams,  # 0
+            height // self.downsample_factor,  # 1
+            self.downsample_factor,  # 2
+            width // self.downsample_factor,  # 3
+            self.downsample_factor,  # 4
+            1,  # 5
         )
-        lidar_depth = lidar_depth.permute(0, 1, 3, 5, 2, 4).contiguous()
+        lidar_depth = lidar_depth.permute(
+            0, 1, 3, 5, 2, 4).contiguous()  # 交换顺序，把H,W重新靠在一起
         lidar_depth = lidar_depth.view(
-            -1, self.downsample_factor * self.downsample_factor)
+            -1, self.downsample_factor * self.downsample_factor)  # 相当于16*16放到一起
         gt_depths_tmp = torch.where(lidar_depth == 0.0, lidar_depth.max(),
                                     lidar_depth)
-        lidar_depth = torch.min(gt_depths_tmp, dim=-1).values
+        lidar_depth = torch.min(gt_depths_tmp, dim=-1).values  # 最小化聚合
         lidar_depth = lidar_depth.view(batch_size, num_sweeps, num_cams, 1,
                                        height // self.downsample_factor,
-                                       width // self.downsample_factor)
-        lidar_depth = lidar_depth / self.d_bound[1]
+                                       width // self.downsample_factor)  # 恢复成原来的格式
+        lidar_depth = lidar_depth / self.d_bound[1]  # 三个维度上的什么东西
         return lidar_depth

@@ -212,6 +212,8 @@ class DepthNet(nn.Module):
         )
 
     def forward(self, x, mats_dict):
+        # 获取各类矩阵
+        # BEVDepth的做法是将变换矩阵编码进网络
         intrins = mats_dict['intrin_mats'][:, 0:1, ...,
                                            :3, :3]  # batchsize*1*camera_number*4*4,内参
         batch_size = intrins.shape[0]
@@ -346,7 +348,7 @@ class BaseLSSFPN(nn.Module):
         """
 
         super(BaseLSSFPN, self).__init__()
-        self.downsample_factor = downsample_factor
+        self.downsample_factor = downsample_factor  # 降采样率，对齐深度图与图像
         self.d_bound = d_bound
         self.final_dim = final_dim
         self.output_channels = output_channels
@@ -367,7 +369,9 @@ class BaseLSSFPN(nn.Module):
         self.depth_channels, _, _, _ = self.frustum.shape
 
         self.img_backbone = build_backbone(img_backbone_conf)
+        # mmdet构建backbone
         self.img_neck = build_neck(img_neck_conf)
+        # mmdet3d构建neck
         self.depth_net = self._configure_depth_net(depth_net_conf)
 
         self.img_neck.init_weights()
@@ -440,16 +444,16 @@ class BaseLSSFPN(nn.Module):
         batch_size, num_cams, _, _ = sensor2ego_mat.shape
 
         # undo post-transformation
-        # B x N x D x H x W x 3
-        points = self.frustum
+        # B x N x D x H x W x 4
+        points = self.frustum  # 齐次坐标
         ida_mat = ida_mat.view(batch_size, num_cams, 1, 1, 1, 4, 4)
-        points = ida_mat.inverse().matmul(points.unsqueeze(-1))
+        points = ida_mat.inverse().matmul(points.unsqueeze(-1))  # 抵消图像增强影响
         # cam_to_ego
         points = torch.cat(
             (points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
              points[:, :, :, :, :, 2:]), 5)
 
-        combine = sensor2ego_mat.matmul(torch.inverse(intrin_mat))
+        combine = sensor2ego_mat.matmul(torch.inverse(intrin_mat))  # 变换到自身坐标系
         points = combine.view(batch_size, num_cams, 1, 1, 1, 4,
                               4).matmul(points)
         if bda_mat is not None:
@@ -465,11 +469,12 @@ class BaseLSSFPN(nn.Module):
         batch_size, num_sweeps, num_cams, num_channels, imH, imW = imgs.shape
 
         imgs = imgs.flatten().view(batch_size * num_sweeps * num_cams,
-                                   num_channels, imH, imW)
-        img_feats = self.img_neck(self.img_backbone(imgs))[0]
+                                   num_channels, imH, imW)  # [n, c, h, w]
+        img_feats = self.img_neck(self.img_backbone(imgs))[
+            0]  # [n, c, h/downsample, w/downsample]
         img_feats = img_feats.reshape(batch_size, num_sweeps, num_cams,
                                       img_feats.shape[1], img_feats.shape[2],
-                                      img_feats.shape[3])
+                                      img_feats.shape[3])  # 恢复形状
         return img_feats
 
     def _forward_depth_net(self, feat, mats_dict):

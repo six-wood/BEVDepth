@@ -75,7 +75,7 @@ ida_aug_conf = {  # 图像数据增强参数
     6,
 }
 
-bda_aug_conf = {  # 点云数据增强参数
+bda_aug_conf = {  # BEV数据增强参数
     'rot_lim': (-22.5, 22.5),
     'scale_lim': (0.95, 1.05),
     'flip_dx_ratio': 0.5,

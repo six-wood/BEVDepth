@@ -60,7 +60,7 @@ class BaseBEVDepth(nn.Module):
             preds = self.head(x)
             return preds, depth_pred
         else:
-            x = self.backbone(x, mats_dict, timestamps)
+            x = self.backbone(x, mats_dict, timestamps)  # bev feature backbone
             preds = self.head(x)
             return preds
 

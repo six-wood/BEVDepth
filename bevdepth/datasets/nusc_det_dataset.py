@@ -1,3 +1,11 @@
+
+'''
+数据集搭载函数
+main task
+1、从数据集读取数据
+2、计算各类矩阵   时序坐标系变换矩阵、图像变换矩阵、深度变换矩阵、各传感器坐标系变换矩阵
+'''
+
 import os
 
 import mmcv
@@ -46,7 +54,7 @@ def get_rot(h):
     ])  # 根据角度计算旋转矩阵
 
 
-def img_transform(img, resize, resize_dims, crop, flip, rotate):  # 进行图像增强，并返回图像增强矩阵
+def img_transform(img, resize, resize_dims, crop, flip, rotate):  # 进行图像变换（增强），并返回图像增强矩阵
     ida_rot = torch.eye(2)
     ida_tran = torch.zeros(2)
     # adjust image
@@ -54,7 +62,7 @@ def img_transform(img, resize, resize_dims, crop, flip, rotate):  # 进行图像
     img = img.crop(crop)  # crop 新图像范围
     if flip:
         img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
-    img = img.rotate(rotate)
+    img = img.rotate(rotate)  # 中心旋转
 
     # 按顺序记录图像增强矩阵
     # post-homography transformation
@@ -67,8 +75,8 @@ def img_transform(img, resize, resize_dims, crop, flip, rotate):  # 进行图像
         ida_rot = A.matmul(ida_rot)  # 合并了轴对称和resize
         ida_tran = A.matmul(ida_tran) + b  # 剪切平移->轴对称对称->平移一个剪切后图像的距离
     A = get_rot(rotate / 180 * np.pi)  # 旋转
-    b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2  # 中心平移
-    b = A.matmul(-b) + b
+    b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2  # 图像中心
+    b = A.matmul(-b) + b  # 图像中心平移到中心->旋转->移动回原位置
     ida_rot = A.matmul(ida_rot)  # 合并所有旋转
     ida_tran = A.matmul(ida_tran) + b  # 合并所有平移，平移受旋转影响
     ida_mat = ida_rot.new_zeros(4, 4)
@@ -79,39 +87,42 @@ def img_transform(img, resize, resize_dims, crop, flip, rotate):  # 进行图像
     return img, ida_mat
 
 
-def bev_transform(gt_boxes, rotate_angle, scale_ratio, flip_dx, flip_dy):  # 根据图像增强参数对gt_boxes进行变换
-    # gt_box为三维边界框，与图像增强的二维变换不一样
+def bev_transform(gt_boxes, rotate_angle, scale_ratio, flip_dx, flip_dy):  # bev空间变换（增强）
+    # gt_box为三维边界框，x,y,z,h,w,l,theta
     rotate_angle = torch.tensor(rotate_angle / 180 * np.pi)
     rot_sin = torch.sin(rotate_angle)
     rot_cos = torch.cos(rotate_angle)
     rot_mat = torch.Tensor([[rot_cos, -rot_sin, 0], [rot_sin, rot_cos, 0],
-                            [0, 0, 1]])
+                            [0, 0, 1]])  # 三维旋转矩阵
     scale_mat = torch.Tensor([[scale_ratio, 0, 0], [0, scale_ratio, 0],
-                              [0, 0, scale_ratio]])
+                              [0, 0, scale_ratio]])  # 三维缩放矩阵
     flip_mat = torch.Tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
     if flip_dx:
         flip_mat = flip_mat @ torch.Tensor([[-1, 0, 0], [0, 1, 0], [0, 0, 1]])
     if flip_dy:
         flip_mat = flip_mat @ torch.Tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]])
-    rot_mat = flip_mat @ (scale_mat @ rot_mat)
+        # 翻转矩阵
+    rot_mat = flip_mat @ (scale_mat @ rot_mat)  # 合并
     if gt_boxes.shape[0] > 0:
-        gt_boxes[:, :3] = (rot_mat @ gt_boxes[:, :3].unsqueeze(-1)).squeeze(-1)
-        gt_boxes[:, 3:6] *= scale_ratio
-        gt_boxes[:, 6] += rotate_angle
+        gt_boxes[:, :3] = (
+            rot_mat @ gt_boxes[:, :3].unsqueeze(-1)).squeeze(-1)  # x,y,z旋转
+        gt_boxes[:, 3:6] *= scale_ratio  # w,h,l缩放
+        gt_boxes[:, 6] += rotate_angle  # 旋转角度变化
         if flip_dx:
-            gt_boxes[:, 6] = 2 * torch.asin(torch.tensor(1.0)) - gt_boxes[:, 6]
+            gt_boxes[:, 6] = 2 * \
+                torch.asin(torch.tensor(1.0)) - gt_boxes[:, 6]  # 绕x轴翻转
         if flip_dy:
-            gt_boxes[:, 6] = -gt_boxes[:, 6]
+            gt_boxes[:, 6] = -gt_boxes[:, 6]  # 绕y轴翻转
         gt_boxes[:, 7:] = (
-            rot_mat[:2, :2] @ gt_boxes[:, 7:].unsqueeze(-1)).squeeze(-1)
+            rot_mat[:2, :2] @ gt_boxes[:, 7:].unsqueeze(-1)).squeeze(-1)  # 水平速度参数旋转
     return gt_boxes, rot_mat
 
 
-def depth_transform(cam_depth, resize, resize_dims, crop, flip, rotate):
+def depth_transform(cam_depth, resize, resize_dims, crop, flip, rotate):  # 深度监督同步变换（增强）
     """Transform depth based on ida augmentation configuration.
 
     Args:
-        cam_depth (np array): Nx3, 3: x,y,d.
+        cam_depth (np array): Nx3, 3: x,y,d.点云，非图像
         resize (float): Resize factor.
         resize_dims (list): Final dimension.
         crop (list): x1, y1, x2, y2
@@ -123,24 +134,24 @@ def depth_transform(cam_depth, resize, resize_dims, crop, flip, rotate):
     """
 
     H, W = resize_dims
-    cam_depth[:, :2] = cam_depth[:, :2] * resize
-    cam_depth[:, 0] -= crop[0]
-    cam_depth[:, 1] -= crop[1]
+    cam_depth[:, :2] = cam_depth[:, :2] * resize  # 三维resize
+    cam_depth[:, 0] -= crop[0]  # 平移
+    cam_depth[:, 1] -= crop[1]  # 平移
     if flip:
-        cam_depth[:, 0] = resize_dims[1] - cam_depth[:, 0]
+        cam_depth[:, 0] = resize_dims[1] - cam_depth[:, 0]  # 绕轴翻转再平移
 
     cam_depth[:, 0] -= W / 2.0
-    cam_depth[:, 1] -= H / 2.0
+    cam_depth[:, 1] -= H / 2.0  # 把图像中心平移到坐标系中心
 
     h = rotate / 180 * np.pi
     rot_matrix = [
         [np.cos(h), np.sin(h)],
         [-np.sin(h), np.cos(h)],
     ]
-    cam_depth[:, :2] = np.matmul(rot_matrix, cam_depth[:, :2].T).T
+    cam_depth[:, :2] = np.matmul(rot_matrix, cam_depth[:, :2].T).T  # 旋转
 
     cam_depth[:, 0] += W / 2.0
-    cam_depth[:, 1] += H / 2.0
+    cam_depth[:, 1] += H / 2.0  # 移动回原始位置
 
     depth_coords = cam_depth[:, :2].astype(np.int16)
 
@@ -148,22 +159,22 @@ def depth_transform(cam_depth, resize, resize_dims, crop, flip, rotate):
     valid_mask = ((depth_coords[:, 1] < resize_dims[0])
                   & (depth_coords[:, 0] < resize_dims[1])
                   & (depth_coords[:, 1] >= 0)
-                  & (depth_coords[:, 0] >= 0))
+                  & (depth_coords[:, 0] >= 0))  # 约束范围
     depth_map[depth_coords[valid_mask, 1],
               depth_coords[valid_mask, 0]] = cam_depth[valid_mask, 2]
 
-    return torch.Tensor(depth_map)
+    return torch.Tensor(depth_map)  # 输出伪点云深度图
 
 
 def map_pointcloud_to_image(
     lidar_points,
     img,
-    lidar_calibrated_sensor,
-    lidar_ego_pose,
-    cam_calibrated_sensor,
-    cam_ego_pose,
+    lidar_calibrated_sensor,  # 点云标定参数
+    lidar_ego_pose,  # 点云坐标系位置
+    cam_calibrated_sensor,  # 图像标定参数
+    cam_ego_pose,  # 图像坐标系位置
     min_dist: float = 0.0,
-):
+):  # 生成点云深度图，还有时间戳插值？
 
     # Points live in the point sensor frame. So they need to be
     # transformed via global to the image plane.
@@ -174,20 +185,24 @@ def map_pointcloud_to_image(
     lidar_points.rotate(
         Quaternion(lidar_calibrated_sensor['rotation']).rotation_matrix)
     lidar_points.translate(np.array(lidar_calibrated_sensor['translation']))
+    # 变换到自车坐标系
 
     # Second step: transform from ego to the global frame.
     lidar_points.rotate(Quaternion(lidar_ego_pose['rotation']).rotation_matrix)
+    # 变换到点云帧对应的全局坐标系
     lidar_points.translate(np.array(lidar_ego_pose['translation']))
 
     # Third step: transform from global into the ego vehicle
     # frame for the timestamp of the image.
     lidar_points.translate(-np.array(cam_ego_pose['translation']))
     lidar_points.rotate(Quaternion(cam_ego_pose['rotation']).rotation_matrix.T)
+    # 变换到图像帧对应的全局坐标系
 
     # Fourth step: transform from ego into the camera.
     lidar_points.translate(-np.array(cam_calibrated_sensor['translation']))
     lidar_points.rotate(
         Quaternion(cam_calibrated_sensor['rotation']).rotation_matrix.T)
+    # 变化到图像坐标系
 
     # Fifth step: actually take a "picture" of the point cloud.
     # Grab the depths (camera frame z axis points away from the camera).
@@ -198,7 +213,7 @@ def map_pointcloud_to_image(
     # + renormalization).
     points = view_points(lidar_points.points[:3, :],
                          np.array(cam_calibrated_sensor['camera_intrinsic']),
-                         normalize=True)
+                         normalize=True)  # 根据内参投影，nusences自带
 
     # Remove points that are either outside or behind the camera.
     # Leave a margin of 1 pixel for aesthetic reasons. Also make
@@ -210,9 +225,9 @@ def map_pointcloud_to_image(
     mask = np.logical_and(mask, points[0, :] > 1)
     mask = np.logical_and(mask, points[0, :] < img.size[0] - 1)
     mask = np.logical_and(mask, points[1, :] > 1)
-    mask = np.logical_and(mask, points[1, :] < img.size[1] - 1)
+    mask = np.logical_and(mask, points[1, :] < img.size[1] - 1)  # 去除范围外点云
     points = points[:, mask]
-    coloring = coloring[mask]
+    coloring = coloring[mask]  # 保留深度图
 
     return points, coloring
 
@@ -220,17 +235,17 @@ def map_pointcloud_to_image(
 class NuscDetDataset(Dataset):
 
     def __init__(self,
-                 ida_aug_conf,
-                 bda_aug_conf,
-                 classes,
-                 data_root,
+                 ida_aug_conf,  # 图像增强
+                 bda_aug_conf,  # 点云增强
+                 classes,  # 类别
+                 data_root,  # 数据根目录
                  info_paths,
                  is_train,
                  use_cbgs=False,
                  num_sweeps=1,
                  img_conf=dict(img_mean=[123.675, 116.28, 103.53],
                                img_std=[58.395, 57.12, 57.375],
-                               to_rgb=True),
+                               to_rgb=True),  # 图像参数
                  return_depth=False,
                  sweep_idxes=list(),
                  key_idxes=list(),
@@ -255,6 +270,7 @@ class NuscDetDataset(Dataset):
                 default: False.
         """
         super().__init__()
+        # data_info_paths,  nuscenes_dbinfos_10sweeps_withvelo.pkl
         if isinstance(info_paths, list):
             self.infos = list()
             for info_path in info_paths:
@@ -331,6 +347,7 @@ class NuscDetDataset(Dataset):
             crop_h = int(
                 (1 - np.random.uniform(*self.ida_aug_conf['bot_pct_lim'])) *
                 newH) - fH
+            # （newH-fH）-bot_pct*newH
             crop_w = int(np.random.uniform(0, max(0, newW - fW)))
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -349,7 +366,7 @@ class NuscDetDataset(Dataset):
             rotate_ida = 0
         return resize, resize_dims, crop, flip, rotate_ida
 
-    def sample_bda_augmentation(self):
+    def sample_bda_augmentation(self):  # 生成点云增强参数
         """Generate bda augmentation values based on bda_config."""
         if self.is_train:
             rotate_bda = np.random.uniform(*self.bda_aug_conf['rot_lim'])
@@ -364,15 +381,16 @@ class NuscDetDataset(Dataset):
         return rotate_bda, scale_bda, flip_dx, flip_dy
 
     def get_lidar_depth(self, lidar_points, img, lidar_info, cam_info):
+        # 点云标定参数
         lidar_calibrated_sensor = lidar_info['LIDAR_TOP']['calibrated_sensor']
-        lidar_ego_pose = lidar_info['LIDAR_TOP']['ego_pose']
-        cam_calibrated_sensor = cam_info['calibrated_sensor']
-        cam_ego_pose = cam_info['ego_pose']
+        lidar_ego_pose = lidar_info['LIDAR_TOP']['ego_pose']  # 雷达坐标系全局位置
+        cam_calibrated_sensor = cam_info['calibrated_sensor']  # 图像标定参数
+        cam_ego_pose = cam_info['ego_pose']  # 图像坐标系全局位置
         pts_img, depth = map_pointcloud_to_image(
             lidar_points.copy(), img, lidar_calibrated_sensor.copy(),
             lidar_ego_pose.copy(), cam_calibrated_sensor, cam_ego_pose)
-        return np.concatenate([pts_img[:2, :].T, depth[:, None]],
-                              axis=1).astype(np.float32)
+        return np.concatenate([pts_img[:2, :].T, depth[:, None]],  # 生成深度
+                              axis=1).astype(np.float32)  # 拼接点云和深度图
 
     def get_image(self, cam_infos, cams, lidar_infos=None):
         """Given data and cam_names, return image data needed.
@@ -399,6 +417,7 @@ class NuscDetDataset(Dataset):
         sweep_sensor2sensor_mats = list()
         sweep_timestamps = list()
         sweep_lidar_depth = list()
+        # 根据info获取点云
         if self.return_depth or self.use_fusion:
             sweep_lidar_points = list()
             for lidar_info in lidar_infos:
@@ -408,35 +427,38 @@ class NuscDetDataset(Dataset):
                     dtype=np.float32,
                     count=-1).reshape(-1, 5)[..., :4]
                 sweep_lidar_points.append(lidar_points)
+        # 根据info获取图像
         for cam in cams:
             imgs = list()
-            sensor2ego_mats = list()
-            intrin_mats = list()
-            ida_mats = list()
-            sensor2sensor_mats = list()
-            timestamps = list()
-            lidar_depth = list()
-            key_info = cam_infos[0]
+            sensor2ego_mats = list()  # 传感器到全局坐标变换矩阵
+            intrin_mats = list()  # 内参
+            ida_mats = list()  # 图像增强矩阵
+            sensor2sensor_mats = list()  # 传感器到传感器坐标系变换矩阵
+            timestamps = list()  # 时间戳
+            lidar_depth = list()  # 深度
+            key_info = cam_infos[0]  # info #key帧，用于多帧融合
             resize, resize_dims, crop, flip, \
                 rotate_ida = self.sample_ida_augmentation(
-                )
+                )  # 每个图像一个单独的增强参数，多个相机之间没有联合，翻转、旋转等参数也难以统一
+            # 或者说BEV Transform是一种统一增强方式
             for sweep_idx, cam_info in enumerate(cam_infos):
 
                 img = Image.open(
                     os.path.join(self.data_root, cam_info[cam]['filename']))
                 # img = Image.fromarray(img)
                 w, x, y, z = cam_info[cam]['calibrated_sensor']['rotation']
-                # sweep sensor to sweep ego
+                # sweep sensor to sweep ego 当前 传感器 到 自车
                 sweepsensor2sweepego_rot = torch.Tensor(
-                    Quaternion(w, x, y, z).rotation_matrix)
+                    Quaternion(w, x, y, z).rotation_matrix)  # 旋转矩阵
                 sweepsensor2sweepego_tran = torch.Tensor(
-                    cam_info[cam]['calibrated_sensor']['translation'])
+                    cam_info[cam]['calibrated_sensor']['translation'])  # 平移
                 sweepsensor2sweepego = sweepsensor2sweepego_rot.new_zeros(
                     (4, 4))
                 sweepsensor2sweepego[3, 3] = 1
                 sweepsensor2sweepego[:3, :3] = sweepsensor2sweepego_rot
-                sweepsensor2sweepego[:3, -1] = sweepsensor2sweepego_tran
-                # sweep ego to global
+                sweepsensor2sweepego[:3, -
+                                     1] = sweepsensor2sweepego_tran  # 齐次坐标系
+                # sweep ego to global 当前 自车 到 全局
                 w, x, y, z = cam_info[cam]['ego_pose']['rotation']
                 sweepego2global_rot = torch.Tensor(
                     Quaternion(w, x, y, z).rotation_matrix)
@@ -447,7 +469,7 @@ class NuscDetDataset(Dataset):
                 sweepego2global[:3, :3] = sweepego2global_rot
                 sweepego2global[:3, -1] = sweepego2global_tran
 
-                # global sensor to cur ego
+                # global sensor to cur ego 全局 到 关键帧 自车
                 w, x, y, z = key_info[cam]['ego_pose']['rotation']
                 keyego2global_rot = torch.Tensor(
                     Quaternion(w, x, y, z).rotation_matrix)
@@ -457,9 +479,9 @@ class NuscDetDataset(Dataset):
                 keyego2global[3, 3] = 1
                 keyego2global[:3, :3] = keyego2global_rot
                 keyego2global[:3, -1] = keyego2global_tran
-                global2keyego = keyego2global.inverse()
+                global2keyego = keyego2global.inverse()  # 求逆
 
-                # cur ego to sensor
+                # cur ego to sensor 关键帧 自车 到 当前 传感器
                 w, x, y, z = key_info[cam]['calibrated_sensor']['rotation']
                 keysensor2keyego_rot = torch.Tensor(
                     Quaternion(w, x, y, z).rotation_matrix)
@@ -470,12 +492,15 @@ class NuscDetDataset(Dataset):
                 keysensor2keyego[:3, :3] = keysensor2keyego_rot
                 keysensor2keyego[:3, -1] = keysensor2keyego_tran
                 keyego2keysensor = keysensor2keyego.inverse()
+
                 keysensor2sweepsensor = (
                     keyego2keysensor @ global2keyego @ sweepego2global
-                    @ sweepsensor2sweepego).inverse()
+                    @ sweepsensor2sweepego).inverse()  # 关键帧和当前帧传感器之间的变换矩阵
+
                 sweepsensor2keyego = global2keyego @ sweepego2global @\
-                    sweepsensor2sweepego
-                sensor2ego_mats.append(sweepsensor2keyego)
+                    sweepsensor2sweepego  # 当前帧传感器到关键帧自车的变换矩阵
+
+                sensor2ego_mats.append(sweepsensor2keyego)  # 传感器到自车的变换矩阵序列
                 sensor2sensor_mats.append(keysensor2sweepsensor)
                 intrin_mat = torch.zeros((4, 4))
                 intrin_mat[3, 3] = 1
@@ -488,7 +513,7 @@ class NuscDetDataset(Dataset):
                     point_depth_augmented = depth_transform(
                         point_depth, resize, self.ida_aug_conf['final_dim'],
                         crop, flip, rotate_ida)
-                    lidar_depth.append(point_depth_augmented)
+                    lidar_depth.append(point_depth_augmented)  # 生成深度图，并追加
                 img, ida_mat = img_transform(
                     img,
                     resize=resize,
@@ -497,13 +522,15 @@ class NuscDetDataset(Dataset):
                     flip=flip,
                     rotate=rotate_ida,
                 )
-                ida_mats.append(ida_mat)
+                ida_mats.append(ida_mat)  # 计算图像增强变换矩阵
                 img = mmcv.imnormalize(np.array(img), self.img_mean,
-                                       self.img_std, self.to_rgb)
-                img = torch.from_numpy(img).permute(2, 0, 1)
-                imgs.append(img)
-                intrin_mats.append(intrin_mat)
-                timestamps.append(cam_info[cam]['timestamp'])
+                                       self.img_std, self.to_rgb)  # 归一化
+                img = torch.from_numpy(img).permute(2, 0, 1)  # 交换通道
+                imgs.append(img)  # 图像序列
+                intrin_mats.append(intrin_mat)  # 内参序列
+                timestamps.append(cam_info[cam]['timestamp'])  # 时间戳序列
+
+            # 多个相机序列拼接
             sweep_imgs.append(torch.stack(imgs))
             sweep_sensor2ego_mats.append(torch.stack(sensor2ego_mats))
             sweep_intrin_mats.append(torch.stack(intrin_mats))
@@ -512,7 +539,7 @@ class NuscDetDataset(Dataset):
             sweep_timestamps.append(torch.tensor(timestamps))
             if self.return_depth:
                 sweep_lidar_depth.append(torch.stack(lidar_depth))
-        # Get mean pose of all cams.
+        # Get mean pose of all cams. 计算均值
         ego2global_rotation = np.mean(
             [key_info[cam]['ego_pose']['rotation'] for cam in cams], 0)
         ego2global_translation = np.mean(
@@ -534,9 +561,9 @@ class NuscDetDataset(Dataset):
         ]
         if self.return_depth:
             ret_list.append(torch.stack(sweep_lidar_depth).permute(1, 0, 2, 3))
-        return ret_list
+        return ret_list  # 返回图像序列，传感器到自车变换矩阵序列，内参序列，图像增强变换矩阵序列，传感器到传感器变换矩阵序列，时间戳序列，图像深度信息
 
-    def get_gt(self, info, cams):
+    def get_gt(self, info, cams):  # 获取监督真值
         """Generate gt labels from info.
 
         Args:
@@ -554,7 +581,7 @@ class NuscDetDataset(Dataset):
             info['cam_infos'][cam]['ego_pose']['translation'] for cam in cams
         ], 0)
         trans = -np.array(ego2global_translation)
-        rot = Quaternion(ego2global_rotation).inverse
+        rot = Quaternion(ego2global_rotation).inverse  # 全局到自车坐标系变换矩阵
         gt_boxes = list()
         gt_labels = list()
         for ann_info in info['ann_infos']:
@@ -562,28 +589,29 @@ class NuscDetDataset(Dataset):
             if (map_name_from_general_to_detection[ann_info['category_name']]
                     not in self.classes
                     or ann_info['num_lidar_pts'] + ann_info['num_radar_pts'] <=
-                    0):
+                    0):  # 筛选目标类型
                 continue
             box = Box(
                 ann_info['translation'],
                 ann_info['size'],
                 Quaternion(ann_info['rotation']),
                 velocity=ann_info['velocity'],
-            )
+            )  # 生成box
             box.translate(trans)
             box.rotate(rot)
             box_xyz = np.array(box.center)
             box_dxdydz = np.array(box.wlh)[[1, 0, 2]]
             box_yaw = np.array([box.orientation.yaw_pitch_roll[0]])
             box_velo = np.array(box.velocity[:2])
-            gt_box = np.concatenate([box_xyz, box_dxdydz, box_yaw, box_velo])
+            gt_box = np.concatenate(
+                [box_xyz, box_dxdydz, box_yaw, box_velo])  # 拼接真值框
             gt_boxes.append(gt_box)
             gt_labels.append(
                 self.classes.index(map_name_from_general_to_detection[
                     ann_info['category_name']]))
-        return torch.Tensor(gt_boxes), torch.tensor(gt_labels)
+        return torch.Tensor(gt_boxes), torch.tensor(gt_labels)  # 返回真值框和类别
 
-    def choose_cams(self):
+    def choose_cams(self):  # <6生成随即相机序列,==6全取
         """Choose cameras randomly.
 
         Returns:
@@ -598,14 +626,14 @@ class NuscDetDataset(Dataset):
             cams = self.ida_aug_conf['cams']
         return cams
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx):  # 从预先生成好的info里面搭载数据，idx是info的索引
         if self.use_cbgs:
             idx = self.sample_indices[idx]
         cam_infos = list()
         lidar_infos = list()
         # TODO: Check if it still works when number of cameras is reduced.
         cams = self.choose_cams()
-        for key_idx in self.key_idxes:
+        for key_idx in self.key_idxes:  # 多帧序列聚合
             cur_idx = key_idx + idx
             # Handle scenarios when current idx doesn't have previous key
             # frame or previous key frame is from another scene.
@@ -620,8 +648,8 @@ class NuscDetDataset(Dataset):
             lidar_sweep_timestamps = [
                 lidar_sweep['LIDAR_TOP']['timestamp']
                 for lidar_sweep in info['lidar_sweeps']
-            ]
-            for sweep_idx in self.sweeps_idx:
+            ]  # 拼接多帧info
+            for sweep_idx in self.sweeps_idx:  # sweep 未标注数据
                 if len(info['cam_sweeps']) == 0:
                     cam_infos.append(info['cam_infos'])
                     lidar_infos.append(info['lidar_infos'])
@@ -643,7 +671,8 @@ class NuscDetDataset(Dataset):
                             lidar_infos.append(info['lidar_sweeps'][lidar_idx])
                             break
         if self.return_depth or self.use_fusion:
-            image_data_list = self.get_image(cam_infos, cams, lidar_infos)
+            image_data_list = self.get_image(
+                cam_infos, cams, lidar_infos)  # 根据info获取具体数据,包括数据和矩阵
 
         else:
             image_data_list = self.get_image(cam_infos, cams)
@@ -656,7 +685,7 @@ class NuscDetDataset(Dataset):
             sweep_sensor2sensor_mats,
             sweep_timestamps,
             img_metas,
-        ) = image_data_list[:7]
+        ) = image_data_list[:7]  # 把数值付给sweep
         img_metas['token'] = self.infos[idx]['sample_token']
         if self.is_train:
             gt_boxes, gt_labels = self.get_gt(self.infos[idx], cams)
@@ -670,7 +699,7 @@ class NuscDetDataset(Dataset):
         bda_mat = sweep_imgs.new_zeros(4, 4)
         bda_mat[3, 3] = 1
         gt_boxes, bda_rot = bev_transform(gt_boxes, rotate_bda, scale_bda,
-                                          flip_dx, flip_dy)
+                                          flip_dx, flip_dy)  # 根据变换参数生成真值框和其对应变换矩阵
         bda_mat[:3, :3] = bda_rot
         ret_list = [
             sweep_imgs,
@@ -683,7 +712,7 @@ class NuscDetDataset(Dataset):
             img_metas,
             gt_boxes,
             gt_labels,
-        ]
+        ]  # 再拼接真值框和类别
         if self.return_depth:
             ret_list.append(image_data_list[7])
         return ret_list
@@ -754,4 +783,4 @@ def collate_fn(data, is_return_depth=False):
     ]
     if is_return_depth:
         ret_list.append(torch.stack(depth_labels_batch))
-    return ret_list
+    return ret_list  # 范围拼接了一个batch的数据
