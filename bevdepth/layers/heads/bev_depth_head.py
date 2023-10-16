@@ -127,9 +127,9 @@ class BEVDepthHead(CenterHead):
             loss_bbox=loss_bbox,
             separate_head=separate_head,
         )
-        self.trunk = build_backbone(bev_backbone_conf)
-        self.trunk.init_weights()
-        self.neck = build_neck(bev_neck_conf)
+        self.trunk = build_backbone(bev_backbone_conf)  # bev cofig
+        self.trunk.init_weights()  # bev backbone
+        self.neck = build_neck(bev_neck_conf)  # mmdet3d
         self.neck.init_weights()
         del self.trunk.maxpool
         self.gaussian_overlap = gaussian_overlap
@@ -166,7 +166,7 @@ class BEVDepthHead(CenterHead):
         ret_values = super().forward(fpn_output)
         return ret_values
 
-    def get_targets_single(self, gt_bboxes_3d, gt_labels_3d):
+    def get_targets_single(self, gt_bboxes_3d, gt_labels_3d):  # center point
         """Generate training targets for a single sample.
 
         Args:
@@ -339,7 +339,7 @@ class BEVDepthHead(CenterHead):
             num_pos = heatmaps[task_id].eq(1).float().sum().item()
             cls_avg_factor = torch.clamp(reduce_mean(
                 heatmaps[task_id].new_tensor(num_pos)),
-                                         min=1).item()
+                min=1).item()
             loss_heatmap = self.loss_cls(preds_dict[0]['heatmap'],
                                          heatmaps[task_id],
                                          avg_factor=cls_avg_factor)
@@ -436,8 +436,8 @@ class BEVDepthHead(CenterHead):
                         boxes.detach().cpu().numpy(),
                         self.test_cfg['min_radius'][task_id],
                         post_max_size=self.test_cfg['post_max_size']),
-                                        dtype=torch.long,
-                                        device=boxes.device)
+                        dtype=torch.long,
+                        device=boxes.device)
 
                     boxes3d = boxes3d[keep]
                     scores = scores[keep]

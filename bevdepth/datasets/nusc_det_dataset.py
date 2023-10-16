@@ -366,7 +366,7 @@ class NuscDetDataset(Dataset):
             rotate_ida = 0
         return resize, resize_dims, crop, flip, rotate_ida
 
-    def sample_bda_augmentation(self):  # 生成点云增强参数
+    def sample_bda_augmentation(self):  # 生成BEV增强参数
         """Generate bda augmentation values based on bda_config."""
         if self.is_train:
             rotate_bda = np.random.uniform(*self.bda_aug_conf['rot_lim'])

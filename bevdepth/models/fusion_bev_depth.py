@@ -59,9 +59,11 @@ class FusionBEVDepth(BaseBEVDepth):
             preds = self.head(x)
             return preds
         else:
-            # x:Batchsize*sweep*Camera*C*H*W
+            # x_in:Batchsize*sweep*Camera*C*H*W
             # lidar_depth:Batchsize*Camear*1*H*W
             # backbone:LSS BEV特征提取模块
+            # x_out -> batch*C*H*W
             x = self.backbone(x, mats_dict, lidar_depth, timestamps)
+            # 预测头
             preds = self.head(x)
             return preds
